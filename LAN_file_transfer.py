@@ -164,6 +164,24 @@ HTML_PAGE = """
             const file = fileInput.files[0];
             if (!file) return;
 
+            // --- 重複チェック ---
+            try {
+                const checkRes = await fetch(`/check_file_exists?filename=${encodeURIComponent(file.name)}`);
+                if (checkRes.ok) {
+                    const checkData = await checkRes.json();
+                    if (checkData.exists) {
+                        const confirmOverwrite = confirm(`同名のファイル「${file.name}」が既に存在します。\n上書きして送信を続行しますか？`);
+                        if (!confirmOverwrite) {
+                            status.innerText = '同名ファイルが存在するため、送信を中止しました。';
+                            status.style.color = 'black';
+                            return;
+                        }
+                    }
+                }
+            } catch (err) {
+                console.warn("重複チェックに失敗しました。", err);
+            }
+
             resetUI();
             uploadBtn.disabled = true;
             fileInput.disabled = true;
@@ -240,11 +258,10 @@ HTML_PAGE = """
                             speedInfo.innerText = '';
                             await new Promise(res => setTimeout(res, 1000 * attempts));
                             if (isCanceled) break;
-                            sessionStartTime = Date.now(); // リトライ後は計測時間をリセット
+                            sessionStartTime = Date.now();
                             sessionStartBytes = chunkIndex * CHUNK_SIZE;
                         }
 
-                        // 進捗更新コールバック付きでチャンクを送信
                         await sendChunk(chunk, file.name, currentUploadId, chunkIndex, totalChunks, (loadedInChunk) => {
                             if (isPaused || isCanceled) return;
 
@@ -254,11 +271,10 @@ HTML_PAGE = """
                             status.innerText = `${percent}% アップロード中... (${chunkIndex + 1}/${totalChunks} チャンク)`;
                             status.style.color = 'black';
 
-                            // 速度と残り時間のリアルタイム計算
                             const now = Date.now();
                             const elapsedSec = (now - sessionStartTime) / 1000;
 
-                            if (elapsedSec > 0.3) { // 最低0.3秒経過してから計算
+                            if (elapsedSec > 0.3) {
                                 const bytesSentInSession = totalLoadedBytes - sessionStartBytes;
                                 const bytesPerSec = bytesSentInSession / elapsedSec;
                                 const mbPerSec = (bytesPerSec / (1024 * 1024)).toFixed(2);
@@ -304,7 +320,7 @@ HTML_PAGE = """
             fileInput.value = '';
         });
 
-        // チャンク送信関数 (onProgressコールバック対応)
+        // チャンク送信関数
         function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks, onProgress) {
             return new Promise((resolve, reject) => {
                 const formData = new FormData();
@@ -318,7 +334,6 @@ HTML_PAGE = """
                 currentXhr = xhr;
                 xhr.open('POST', '/upload_chunk', true);
 
-                // チャンク内の細かな進捗イベント
                 xhr.upload.onprogress = function(e) {
                     if (e.lengthComputable && onProgress) {
                         onProgress(e.loaded);
@@ -365,6 +380,16 @@ def index():
         retry_lim=RETRY_LIM, 
         chunk_size=CHUNK_SIZE
     )
+
+# 同名ファイルの有無をチェックするAPI
+@app.route('/check_file_exists', methods=['GET'])
+def check_file_exists():
+    filename = secure_filename(request.args.get('filename', ''))
+    if not filename:
+        return jsonify({'exists': False})
+    
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    return jsonify({'exists': os.path.exists(filepath)})
 
 # 進捗確認API
 @app.route('/upload_status', methods=['GET'])
