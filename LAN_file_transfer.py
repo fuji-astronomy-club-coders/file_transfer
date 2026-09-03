@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -59,9 +59,38 @@ HTML_PAGE = """
             progressBar.value = 0;
 
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            const uploadId = Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
 
-            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            // ファイル名・サイズ・更新日時から一意のアップロードIDを作成
+            const rawId = `${file.name}_${file.size}_${file.lastModified}`;
+            const uploadId = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+            // --- 1. サーバーから前回のアップロード進捗を取得（レジューム機能） ---
+            let startChunk = 0;
+            try {
+                const res = await fetch(`/upload_status?upload_id=${uploadId}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    startChunk = data.received_chunks || 0;
+                    if (startChunk > totalChunks) startChunk = totalChunks;
+                }
+            } catch (err) {
+                console.warn("進捗ステータスの取得に失敗しました。最初から送信します。", err);
+            }
+
+            // 進捗に応じた通知表示
+            if (startChunk > 0 && startChunk < totalChunks) {
+                status.innerText = `前回の続き（${startChunk + 1}/${totalChunks} チャンク目）から再開します...`;
+            } else if (startChunk >= totalChunks) {
+                progressBar.value = 100;
+                status.innerText = `「${file.name}」のアップロードはすでに完了しています！`;
+                status.style.color = "green";
+                uploadBtn.disabled = false;
+                fileInput.value = '';
+                return;
+            }
+
+            // --- 2. 未送信のチャンクからアップロードを開始 ---
+            for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex++) {
                 const start = chunkIndex * CHUNK_SIZE;
                 const end = Math.min(file.size, start + CHUNK_SIZE);
                 const chunk = file.slice(start, end);
@@ -69,7 +98,7 @@ HTML_PAGE = """
                 let success = false;
                 let attempts = 0;
 
-                // 失敗時に retry_lim の上限までリトライを実行
+                // 通信失敗時に retry_lim の上限までリトライを実行
                 while (attempts <= retry_lim && !success) {
                     try {
                         if (attempts > 0) {
@@ -143,13 +172,28 @@ HTML_PAGE = """
 
 @app.route('/')
 def index():
-    # Python側の設定値をテンプレート（JS）へ渡す
     return render_template_string(
         HTML_PAGE, 
         retry_lim=RETRY_LIM, 
         chunk_size=CHUNK_SIZE
     )
 
+# 現在の一時ファイルの保存状況（何チャンク目まで受け取ったか）を返すAPI
+@app.route('/upload_status', methods=['GET'])
+def upload_status():
+    upload_id = secure_filename(request.args.get('upload_id', ''))
+    if not upload_id:
+        return jsonify({'received_chunks': 0})
+
+    temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
+    if os.path.exists(temp_filepath):
+        current_size = os.path.getsize(temp_filepath)
+        received_chunks = current_size // CHUNK_SIZE
+        return jsonify({'received_chunks': received_chunks})
+    else:
+        return jsonify({'received_chunks': 0})
+
+# チャンクの書き込みエンドポイント
 @app.route('/upload_chunk', methods=['POST'])
 def upload_chunk():
     chunk = request.files.get('chunk')
@@ -163,11 +207,12 @@ def upload_chunk():
 
     temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
 
-    # チャンクを一時ファイルに追記モードで保存
-    with open(temp_filepath, 'ab') as f:
+    # 特定の位置へ精度高く追記 (seekを利用)
+    with open(temp_filepath, 'a+b') as f:
+        f.seek(chunk_index * CHUNK_SIZE)
         f.write(chunk.read())
 
-    # 最後のチャンクが完了したら、本来の保存場所へ移動
+    # 最後のチャンクが完了したら、一時ファイルから本保存フォルダへ移動
     if chunk_index == total_chunks - 1:
         final_filepath = os.path.join(UPLOAD_FOLDER, filename)
         if os.path.exists(final_filepath):
