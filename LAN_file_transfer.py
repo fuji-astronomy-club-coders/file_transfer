@@ -1,4 +1,5 @@
 import os
+import shutil
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 
@@ -10,8 +11,19 @@ CHUNK_SIZE = 5 * 1024 * 1024        # 1チャンクあたりのサイズ（5MB�
 UPLOAD_FOLDER = 'uploads'
 TEMP_FOLDER = 'temp_uploads'
 
+def cleanup_temp_folder():
+    """起動時に未完了の過去の一時ファイルを全削除する関数"""
+    if os.path.exists(TEMP_FOLDER):
+        try:
+            shutil.rmtree(TEMP_FOLDER)
+            print(f"[起動時クリーンアップ] 一時フォルダ '{TEMP_FOLDER}' を削除・削除初期化しました。")
+        except Exception as e:
+            print(f"[警告] 一時フォルダの削除に失敗しました: {e}")
+    os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+# フォルダ生成とクリーンアップの実行
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(TEMP_FOLDER, exist_ok=True)
+cleanup_temp_folder()
 
 HTML_PAGE = """
 <!DOCTYPE html>
