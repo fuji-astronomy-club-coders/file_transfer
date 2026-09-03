@@ -34,9 +34,9 @@ HTML_PAGE = """
     <title>ファイルアップロード</title>
     <style>
         body { font-family: sans-serif; padding: 20px; }
-        #progressBar { display: none; width: 100%; max-width: 400px; height: 20px; margin-top: 10px; }
+        #progressBar { display: none; width: 100%; max-width: 500px; height: 20px; margin-top: 10px; }
         #status { margin-top: 10px; font-weight: bold; }
-        .btn-group { margin-top: 10px; }
+        #speedInfo { margin-top: 5px; color: #555; font-size: 0.9em; }
         button { padding: 6px 14px; margin-right: 5px; cursor: pointer; }
         button:disabled { cursor: not-allowed; opacity: 0.6; }
     </style>
@@ -53,6 +53,7 @@ HTML_PAGE = """
 
     <progress id="progressBar" value="0" max="100"></progress>
     <div id="status"></div>
+    <div id="speedInfo"></div>
 
     <script>
         // Python側から動的に挿入される設定値
@@ -65,6 +66,10 @@ HTML_PAGE = """
         let isCanceled = false;
         let currentUploadId = '';
 
+        // 速度・時間計測用
+        let sessionStartTime = 0;
+        let sessionStartBytes = 0;
+
         const uploadForm = document.getElementById('uploadForm');
         const fileInput = document.getElementById('fileInput');
         const uploadBtn = document.getElementById('uploadBtn');
@@ -72,6 +77,7 @@ HTML_PAGE = """
         const cancelBtn = document.getElementById('cancelBtn');
         const progressBar = document.getElementById('progressBar');
         const status = document.getElementById('status');
+        const speedInfo = document.getElementById('speedInfo');
 
         // UI表示リセット関数
         function resetUI() {
@@ -80,10 +86,23 @@ HTML_PAGE = """
             pauseBtn.style.display = 'none';
             cancelBtn.style.display = 'none';
             pauseBtn.innerText = '一時停止';
+            speedInfo.innerText = '';
             isPaused = false;
             isCanceled = false;
             currentXhr = null;
             currentUploadId = '';
+        }
+
+        // 時間フォーマット変換関数
+        function formatTime(seconds) {
+            if (!isFinite(seconds) || seconds < 0) return '計算中...';
+            if (seconds < 60) return `${Math.round(seconds)}秒`;
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.round(seconds % 60);
+            if (mins < 60) return `${mins}分${secs}秒`;
+            const hours = Math.floor(mins / 60);
+            const remMins = mins % 60;
+            return `${hours}時間${remMins}分`;
         }
 
         // 一時停止 / 再開 ボタンの処理
@@ -95,14 +114,16 @@ HTML_PAGE = """
                 pauseBtn.innerText = '再開';
                 status.innerText = '一時停止中...';
                 status.style.color = 'orange';
+                speedInfo.innerText = '';
                 if (currentXhr) {
-                    currentXhr.abort(); // 現在通信中のチャンクを中断
+                    currentXhr.abort();
                 }
             } else {
                 isPaused = false;
                 pauseBtn.innerText = '一時停止';
                 status.innerText = '送信を再開中...';
                 status.style.color = 'black';
+                sessionStartTime = 0; // 再開時に速度計測タイマーをリセット
             }
         });
 
@@ -114,13 +135,13 @@ HTML_PAGE = """
             isPaused = false;
 
             if (currentXhr) {
-                currentXhr.abort(); // 通信を中断
+                currentXhr.abort();
             }
 
             status.innerText = 'アップロードを取り消し中...';
             status.style.color = 'red';
+            speedInfo.innerText = '';
 
-            // サーバー側の一時ファイルを削除
             if (currentUploadId) {
                 try {
                     const formData = new FormData();
@@ -156,7 +177,7 @@ HTML_PAGE = """
             const rawId = `${file.name}_${file.size}_${file.lastModified}`;
             currentUploadId = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
 
-            // --- 1. サーバーから前回のアップロード進捗を取得 ---
+            // --- 1. 進捗取得 ---
             let startChunk = 0;
             try {
                 const res = await fetch(`/upload_status?upload_id=${currentUploadId}`);
@@ -180,16 +201,21 @@ HTML_PAGE = """
                 return;
             }
 
-            // --- 2. 未送信のチャンクからアップロードを開始 ---
+            // --- 2. 各チャンクの送信 ---
             for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex++) {
                 if (isCanceled) break;
 
-                // 一時停止状態の待機ループ
                 while (isPaused) {
                     if (isCanceled) break;
                     await new Promise(res => setTimeout(res, 200));
                 }
                 if (isCanceled) break;
+
+                // 計測セッションの初期化
+                if (sessionStartTime === 0) {
+                    sessionStartTime = Date.now();
+                    sessionStartBytes = chunkIndex * CHUNK_SIZE;
+                }
 
                 const start = chunkIndex * CHUNK_SIZE;
                 const end = Math.min(file.size, start + CHUNK_SIZE);
@@ -211,20 +237,43 @@ HTML_PAGE = """
                         if (attempts > 0) {
                             status.innerText = `通信エラーが発生したため再試行中... (${chunkIndex + 1}/${totalChunks} チャンク目, リトライ ${attempts}/${retry_lim})`;
                             status.style.color = 'orange';
+                            speedInfo.innerText = '';
                             await new Promise(res => setTimeout(res, 1000 * attempts));
                             if (isCanceled) break;
-                        } else {
-                            const percent = Math.round((chunkIndex / totalChunks) * 100);
-                            status.innerText = `${percent}% アップロード中... (${chunkIndex + 1}/${totalChunks} チャンク)`;
-                            status.style.color = 'black';
+                            sessionStartTime = Date.now(); // リトライ後は計測時間をリセット
+                            sessionStartBytes = chunkIndex * CHUNK_SIZE;
                         }
 
-                        await sendChunk(chunk, file.name, currentUploadId, chunkIndex, totalChunks);
+                        // 進捗更新コールバック付きでチャンクを送信
+                        await sendChunk(chunk, file.name, currentUploadId, chunkIndex, totalChunks, (loadedInChunk) => {
+                            if (isPaused || isCanceled) return;
+
+                            const totalLoadedBytes = (chunkIndex * CHUNK_SIZE) + loadedInChunk;
+                            const percent = Math.round((totalLoadedBytes / file.size) * 100);
+                            progressBar.value = percent;
+                            status.innerText = `${percent}% アップロード中... (${chunkIndex + 1}/${totalChunks} チャンク)`;
+                            status.style.color = 'black';
+
+                            // 速度と残り時間のリアルタイム計算
+                            const now = Date.now();
+                            const elapsedSec = (now - sessionStartTime) / 1000;
+
+                            if (elapsedSec > 0.3) { // 最低0.3秒経過してから計算
+                                const bytesSentInSession = totalLoadedBytes - sessionStartBytes;
+                                const bytesPerSec = bytesSentInSession / elapsedSec;
+                                const mbPerSec = (bytesPerSec / (1024 * 1024)).toFixed(2);
+
+                                const remainingBytes = file.size - totalLoadedBytes;
+                                const etaSec = remainingBytes / bytesPerSec;
+
+                                speedInfo.innerText = `速度: ${mbPerSec} MB/s | 残り時間: 約 ${formatTime(etaSec)}`;
+                            }
+                        });
+
                         success = true;
                     } catch (err) {
                         if (isCanceled) break;
 
-                        // 一時停止で中断された場合はリトライ回数としてカウントしない
                         if (err.message === 'paused') {
                             continue;
                         }
@@ -233,6 +282,7 @@ HTML_PAGE = """
                         if (attempts > retry_lim) {
                             status.innerText = `エラー: チャンク ${chunkIndex + 1} の送信に失敗しました（${retry_lim}回試行後失敗）。`;
                             status.style.color = 'red';
+                            speedInfo.innerText = '';
                             resetUI();
                             return;
                         }
@@ -240,23 +290,22 @@ HTML_PAGE = """
                 }
 
                 if (isCanceled) break;
-
-                const percentComplete = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-                progressBar.value = percentComplete;
             }
 
             if (isCanceled) return;
 
-            // アップロード成功時
+            // アップロード完了処理
+            progressBar.value = 100;
             status.innerText = `「${file.name}」のアップロードが完了しました！`;
             status.style.color = 'green';
+            speedInfo.innerText = '';
             progressBar.style.display = 'none';
             resetUI();
             fileInput.value = '';
         });
 
-        // チャンク送信関数
-        function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks) {
+        // チャンク送信関数 (onProgressコールバック対応)
+        function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks, onProgress) {
             return new Promise((resolve, reject) => {
                 const formData = new FormData();
                 formData.append('chunk', chunk);
@@ -266,8 +315,15 @@ HTML_PAGE = """
                 formData.append('total_chunks', totalChunks);
 
                 const xhr = new XMLHttpRequest();
-                currentXhr = xhr; // アボート（中断）できるように参照を保持
+                currentXhr = xhr;
                 xhr.open('POST', '/upload_chunk', true);
+
+                // チャンク内の細かな進捗イベント
+                xhr.upload.onprogress = function(e) {
+                    if (e.lengthComputable && onProgress) {
+                        onProgress(e.loaded);
+                    }
+                };
 
                 xhr.onload = function() {
                     currentXhr = null;
