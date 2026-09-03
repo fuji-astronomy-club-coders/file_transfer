@@ -16,12 +16,12 @@ def cleanup_temp_folder():
     if os.path.exists(TEMP_FOLDER):
         try:
             shutil.rmtree(TEMP_FOLDER)
-            print(f"[起動時クリーンアップ] 一時フォルダ '{TEMP_FOLDER}' を削除・削除初期化しました。")
+            print(f"[起動時クリーンアップ] 一時フォルダ '{TEMP_FOLDER}' を削除初期化しました。")
         except Exception as e:
             print(f"[警告] 一時フォルダの削除に失敗しました: {e}")
     os.makedirs(TEMP_FOLDER, exist_ok=True)
 
-# フォルダ生成とクリーンアップの実行
+# フォルダ生成と起動時クリーンアップ
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 cleanup_temp_folder()
 
@@ -36,6 +36,9 @@ HTML_PAGE = """
         body { font-family: sans-serif; padding: 20px; }
         #progressBar { display: none; width: 100%; max-width: 400px; height: 20px; margin-top: 10px; }
         #status { margin-top: 10px; font-weight: bold; }
+        .btn-group { margin-top: 10px; }
+        button { padding: 6px 14px; margin-right: 5px; cursor: pointer; }
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
     </style>
 </head>
 <body>
@@ -44,6 +47,8 @@ HTML_PAGE = """
         <input type="file" id="fileInput" name="video_file" accept="video/*,.ser" required>
         <br><br>
         <button type="submit" id="uploadBtn">アップロード</button>
+        <button type="button" id="pauseBtn" style="display:none;">一時停止</button>
+        <button type="button" id="cancelBtn" style="display:none;">キャンセル</button>
     </form>
 
     <progress id="progressBar" value="0" max="100"></progress>
@@ -54,32 +59,107 @@ HTML_PAGE = """
         const retry_lim = {{ retry_lim }};
         const CHUNK_SIZE = {{ chunk_size }};
 
-        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+        // 状態管理変数
+        let currentXhr = null;
+        let isPaused = false;
+        let isCanceled = false;
+        let currentUploadId = '';
+
+        const uploadForm = document.getElementById('uploadForm');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const cancelBtn = document.getElementById('cancelBtn');
+        const progressBar = document.getElementById('progressBar');
+        const status = document.getElementById('status');
+
+        // UI表示リセット関数
+        function resetUI() {
+            uploadBtn.disabled = false;
+            fileInput.disabled = false;
+            pauseBtn.style.display = 'none';
+            cancelBtn.style.display = 'none';
+            pauseBtn.innerText = '一時停止';
+            isPaused = false;
+            isCanceled = false;
+            currentXhr = null;
+            currentUploadId = '';
+        }
+
+        // 一時停止 / 再開 ボタンの処理
+        pauseBtn.addEventListener('click', function() {
+            if (isCanceled) return;
+
+            if (!isPaused) {
+                isPaused = true;
+                pauseBtn.innerText = '再開';
+                status.innerText = '一時停止中...';
+                status.style.color = 'orange';
+                if (currentXhr) {
+                    currentXhr.abort(); // 現在通信中のチャンクを中断
+                }
+            } else {
+                isPaused = false;
+                pauseBtn.innerText = '一時停止';
+                status.innerText = '送信を再開中...';
+                status.style.color = 'black';
+            }
+        });
+
+        // キャンセル ボタンの処理
+        cancelBtn.addEventListener('click', async function() {
+            if (isCanceled) return;
+
+            isCanceled = true;
+            isPaused = false;
+
+            if (currentXhr) {
+                currentXhr.abort(); // 通信を中断
+            }
+
+            status.innerText = 'アップロードを取り消し中...';
+            status.style.color = 'red';
+
+            // サーバー側の一時ファイルを削除
+            if (currentUploadId) {
+                try {
+                    const formData = new FormData();
+                    formData.append('upload_id', currentUploadId);
+                    await fetch('/upload_cancel', { method: 'POST', body: formData });
+                } catch (err) {
+                    console.warn('キャンセルリクエスト送信に失敗しました:', err);
+                }
+            }
+
+            status.innerText = 'アップロードをキャンセルしました。';
+            progressBar.style.display = 'none';
+            progressBar.value = 0;
+            resetUI();
+        });
+
+        uploadForm.addEventListener('submit', async function(e) {
             e.preventDefault();
 
-            const fileInput = document.getElementById('fileInput');
             const file = fileInput.files[0];
             if (!file) return;
 
-            const progressBar = document.getElementById('progressBar');
-            const status = document.getElementById('status');
-            const uploadBtn = document.getElementById('uploadBtn');
-
+            resetUI();
             uploadBtn.disabled = true;
-            status.style.color = "black";
+            fileInput.disabled = true;
+            pauseBtn.style.display = 'inline-block';
+            cancelBtn.style.display = 'inline-block';
+            status.style.color = 'black';
             progressBar.style.display = 'block';
             progressBar.value = 0;
 
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-            // ファイル名・サイズ・更新日時から一意のアップロードIDを作成
             const rawId = `${file.name}_${file.size}_${file.lastModified}`;
-            const uploadId = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
+            currentUploadId = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
 
-            // --- 1. サーバーから前回のアップロード進捗を取得（レジューム機能） ---
+            // --- 1. サーバーから前回のアップロード進捗を取得 ---
             let startChunk = 0;
             try {
-                const res = await fetch(`/upload_status?upload_id=${uploadId}`);
+                const res = await fetch(`/upload_status?upload_id=${currentUploadId}`);
                 if (res.ok) {
                     const data = await res.json();
                     startChunk = data.received_chunks || 0;
@@ -89,20 +169,28 @@ HTML_PAGE = """
                 console.warn("進捗ステータスの取得に失敗しました。最初から送信します。", err);
             }
 
-            // 進捗に応じた通知表示
             if (startChunk > 0 && startChunk < totalChunks) {
                 status.innerText = `前回の続き（${startChunk + 1}/${totalChunks} チャンク目）から再開します...`;
             } else if (startChunk >= totalChunks) {
                 progressBar.value = 100;
                 status.innerText = `「${file.name}」のアップロードはすでに完了しています！`;
-                status.style.color = "green";
-                uploadBtn.disabled = false;
+                status.style.color = 'green';
+                resetUI();
                 fileInput.value = '';
                 return;
             }
 
             // --- 2. 未送信のチャンクからアップロードを開始 ---
             for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex++) {
+                if (isCanceled) break;
+
+                // 一時停止状態の待機ループ
+                while (isPaused) {
+                    if (isCanceled) break;
+                    await new Promise(res => setTimeout(res, 200));
+                }
+                if (isCanceled) break;
+
                 const start = chunkIndex * CHUNK_SIZE;
                 const end = Math.min(file.size, start + CHUNK_SIZE);
                 const chunk = file.slice(start, end);
@@ -110,46 +198,64 @@ HTML_PAGE = """
                 let success = false;
                 let attempts = 0;
 
-                // 通信失敗時に retry_lim の上限までリトライを実行
                 while (attempts <= retry_lim && !success) {
+                    if (isCanceled) break;
+
+                    while (isPaused) {
+                        if (isCanceled) break;
+                        await new Promise(res => setTimeout(res, 200));
+                    }
+                    if (isCanceled) break;
+
                     try {
                         if (attempts > 0) {
                             status.innerText = `通信エラーが発生したため再試行中... (${chunkIndex + 1}/${totalChunks} チャンク目, リトライ ${attempts}/${retry_lim})`;
-                            status.style.color = "orange";
-                            await new Promise(res => setTimeout(res, 1000 * attempts)); // 試行回数に応じて待機
+                            status.style.color = 'orange';
+                            await new Promise(res => setTimeout(res, 1000 * attempts));
+                            if (isCanceled) break;
                         } else {
                             const percent = Math.round((chunkIndex / totalChunks) * 100);
                             status.innerText = `${percent}% アップロード中... (${chunkIndex + 1}/${totalChunks} チャンク)`;
-                            status.style.color = "black";
+                            status.style.color = 'black';
                         }
 
-                        await sendChunk(chunk, file.name, uploadId, chunkIndex, totalChunks);
+                        await sendChunk(chunk, file.name, currentUploadId, chunkIndex, totalChunks);
                         success = true;
                     } catch (err) {
+                        if (isCanceled) break;
+
+                        // 一時停止で中断された場合はリトライ回数としてカウントしない
+                        if (err.message === 'paused') {
+                            continue;
+                        }
+
                         attempts++;
                         if (attempts > retry_lim) {
                             status.innerText = `エラー: チャンク ${chunkIndex + 1} の送信に失敗しました（${retry_lim}回試行後失敗）。`;
-                            status.style.color = "red";
-                            uploadBtn.disabled = false;
+                            status.style.color = 'red';
+                            resetUI();
                             return;
                         }
                     }
                 }
 
-                // プログレスバーの更新
+                if (isCanceled) break;
+
                 const percentComplete = Math.round(((chunkIndex + 1) / totalChunks) * 100);
                 progressBar.value = percentComplete;
             }
 
-            // 全チャンク完了時
+            if (isCanceled) return;
+
+            // アップロード成功時
             status.innerText = `「${file.name}」のアップロードが完了しました！`;
-            status.style.color = "green";
+            status.style.color = 'green';
             progressBar.style.display = 'none';
-            uploadBtn.disabled = false;
+            resetUI();
             fileInput.value = '';
         });
 
-        // チャンク単位での送信関数
+        // チャンク送信関数
         function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks) {
             return new Promise((resolve, reject) => {
                 const formData = new FormData();
@@ -160,9 +266,11 @@ HTML_PAGE = """
                 formData.append('total_chunks', totalChunks);
 
                 const xhr = new XMLHttpRequest();
+                currentXhr = xhr; // アボート（中断）できるように参照を保持
                 xhr.open('POST', '/upload_chunk', true);
 
                 xhr.onload = function() {
+                    currentXhr = null;
                     if (xhr.status === 200) {
                         resolve();
                     } else {
@@ -171,7 +279,19 @@ HTML_PAGE = """
                 };
 
                 xhr.onerror = function() {
+                    currentXhr = null;
                     reject(new Error('通信エラー'));
+                };
+
+                xhr.onabort = function() {
+                    currentXhr = null;
+                    if (isCanceled) {
+                        reject(new Error('canceled'));
+                    } else if (isPaused) {
+                        reject(new Error('paused'));
+                    } else {
+                        reject(new Error('aborted'));
+                    }
                 };
 
                 xhr.send(formData);
@@ -190,7 +310,7 @@ def index():
         chunk_size=CHUNK_SIZE
     )
 
-# 現在の一時ファイルの保存状況（何チャンク目まで受け取ったか）を返すAPI
+# 進捗確認API
 @app.route('/upload_status', methods=['GET'])
 def upload_status():
     upload_id = secure_filename(request.args.get('upload_id', ''))
@@ -205,7 +325,7 @@ def upload_status():
     else:
         return jsonify({'received_chunks': 0})
 
-# チャンクの書き込みエンドポイント
+# チャンク書き込みAPI
 @app.route('/upload_chunk', methods=['POST'])
 def upload_chunk():
     chunk = request.files.get('chunk')
@@ -219,17 +339,32 @@ def upload_chunk():
 
     temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
 
-    # 特定の位置へ精度高く追記 (seekを利用)
     with open(temp_filepath, 'a+b') as f:
         f.seek(chunk_index * CHUNK_SIZE)
         f.write(chunk.read())
 
-    # 最後のチャンクが完了したら、一時ファイルから本保存フォルダへ移動
     if chunk_index == total_chunks - 1:
         final_filepath = os.path.join(UPLOAD_FOLDER, filename)
         if os.path.exists(final_filepath):
             os.remove(final_filepath)
         os.rename(temp_filepath, final_filepath)
+
+    return "OK", 200
+
+# キャンセルAPI (一時ファイルの破棄)
+@app.route('/upload_cancel', methods=['POST'])
+def upload_cancel():
+    upload_id = secure_filename(request.form.get('upload_id', ''))
+    if not upload_id:
+        return "データが無効です", 400
+
+    temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
+    if os.path.exists(temp_filepath):
+        try:
+            os.remove(temp_filepath)
+            print(f"[キャンセル] 一時ファイル '{upload_id}' を削除しました。")
+        except Exception as e:
+            print(f"[警告] 一時ファイルの削除に失敗しました: {e}")
 
     return "OK", 200
 
