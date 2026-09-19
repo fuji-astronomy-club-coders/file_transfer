@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
+# logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # --- 2. YAML設定の読み込みと生成 ---
 CONFIG_FILE = 'file_transfar_config.yaml'
@@ -67,6 +67,15 @@ PORT = config.get('PORT', 5000)
 
 app = Flask(__name__)
 
+@app.before_request
+def suppress_werkzeug_logs_after_first_request():
+    """初回アクセス時にWerkzeugのログレベルをWARNINGに変更し、その旨をログに残す"""
+    logger.info(f"[{request.remote_addr}] 初回接続を検知したため、Werkzeugのログレベルを WARNING に変更します。")
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+    
+    # 2回目以降のアクセスで毎回実行されないよう関数自体を取り除く
+    app.before_request_funcs[None].remove(suppress_werkzeug_logs_after_first_request)
+    
 def cleanup_temp_folder():
     """起動時に未完了の過去の一時ファイルを全削除する関数"""
     if os.path.exists(TEMP_FOLDER):
@@ -217,8 +226,16 @@ HTML_PAGE = """
             const remMins = mins % 60;
             return `${hours}時間${remMins}分`;
         }
+        // ファイルサイズを適切な単位にフォーマットする関数 (追加)
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
 
-        // キュー表示を更新する関数
+        // キュー表示を更新する関数 (修正)
         function renderQueue() {
             queueBody.innerHTML = '';
             fileQueue.forEach((file, index) => {
@@ -230,7 +247,8 @@ HTML_PAGE = """
                 tdName.className = 'file-name-cell';
                 
                 const tdSize = document.createElement('td');
-                tdSize.innerText = (file.size / (1024 * 1024)).toFixed(1) + ' MB';
+                // ↓ 固定表示から formatFileSize() 関数に呼び出しを変更
+                tdSize.innerText = formatFileSize(file.size);
                 
                 const tdStatus = document.createElement('td');
                 const tdAction = document.createElement('td');
