@@ -320,16 +320,11 @@ HTML_PAGE = """
             // ファイル入力とフォルダ入力のファイルを結合
             const files = Array.from(fileInput.files).concat(Array.from(folderInput.files));
             
-            // 拡張子フィルタ（フォルダ選択時の無関係なファイルを除外）
-            const allowedExtensions = ['.ser'];
-            fileQueue = files.filter(file => {
-                if (file.type.startsWith('video/')) return true;
-                const name = file.name.toLowerCase();
-                return allowedExtensions.some(ext => name.endsWith(ext));
-            });
+            // すべてのファイルをキューに追加（フィルタリング処理を削除）
+            fileQueue = files;
 
             if (fileQueue.length === 0) {
-                alert('アップロード対象のファイル（動画または.ser）が選択されていません。');
+                alert('アップロード対象のファイルが選択されていません。');
                 return;
             }
 
