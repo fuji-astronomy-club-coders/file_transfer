@@ -11,15 +11,24 @@ from werkzeug.utils import secure_filename
 # --- 1. 詳細なロギングの設定 ---
 LOG_FILE = Path('logs') / f'transfer_server{ datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log'  # noqa: DTZ005
 LOG_FILE.parent.mkdir(exist_ok=True)
+
+file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
+    level=logging.DEBUG,  # ルートロガーのレベル
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler()
+        file_handler,
+        stream_handler
     ]
 )
 logger = logging.getLogger(__name__)
+
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # --- 2. YAML設定の読み込みと生成 ---
 CONFIG_FILE = 'file_transfar_config.yaml'
