@@ -1,0 +1,8 @@
+LAN File Transfer config:
+  version : 1.00
+  RETRY_LIM: 3
+  CHUNK_SIZE: 5242880
+  UPLOAD_FOLDER: uploads
+  TEMP_FOLDER: temp_uploads
+  HOST: "0.0.0.0"
+  PORT: 5000

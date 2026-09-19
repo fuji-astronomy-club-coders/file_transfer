@@ -2,12 +2,15 @@ import datetime
 import logging
 import os
 import shutil
+from pathlib import Path
+
 import yaml
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
 
 # --- 1. 詳細なロギングの設定 ---
-LOG_FILE = 'transfer_server.log'
+LOG_FILE = Path('logs') / f'transfer_server{ datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log'  # noqa: DTZ005
+LOG_FILE.parent.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -19,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- 2. YAML設定の読み込みと生成 ---
-CONFIG_FILE = 'config.yaml'
+CONFIG_FILE = 'file_transfar_config.yaml'
 DEFAULT_CONFIG = {
     'RETRY_LIM': 3,
     'CHUNK_SIZE': 5242880,  # 5MB (5 * 1024 * 1024)
