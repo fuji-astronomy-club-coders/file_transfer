@@ -1,8 +1,9 @@
+import datetime
+import logging
 import os
 import shutil
 import yaml
-import logging
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
 
 # --- 1. 詳細なロギングの設定 ---
@@ -68,36 +69,56 @@ def cleanup_temp_folder():
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 cleanup_temp_folder()
 
-# --- HTMLテンプレート (前回から変更なし) ---
+# --- HTMLテンプレート ---
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ファイルアップロード</title>
+    <title>ファイル一括アップロード</title>
     <style>
-        body { font-family: sans-serif; padding: 20px; }
-        #progressBar { display: none; width: 100%; max-width: 500px; height: 20px; margin-top: 10px; }
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .input-group { margin-bottom: 15px; padding: 10px; border: 1px solid #ddd; background: #fdfdfd; max-width: 500px;}
+        progress { width: 100%; max-width: 500px; height: 20px; margin-top: 5px; }
+        .progress-container { display: none; margin-top: 20px; padding: 15px; border: 1px solid #ccc; max-width: 500px; background-color: #f9f9f9; }
+        .progress-title { font-weight: bold; margin-bottom: 5px; }
         #status { margin-top: 10px; font-weight: bold; }
         #speedInfo { margin-top: 5px; color: #555; font-size: 0.9em; }
-        button { padding: 6px 14px; margin-right: 5px; cursor: pointer; }
+        button { padding: 8px 16px; margin-right: 5px; cursor: pointer; font-size: 14px; }
         button:disabled { cursor: not-allowed; opacity: 0.6; }
     </style>
 </head>
 <body>
     <h1>動画・.serファイルを送信</h1>
     <form id="uploadForm">
-        <input type="file" id="fileInput" name="video_file" accept="video/*,.ser" required>
-        <br><br>
-        <button type="submit" id="uploadBtn">アップロード</button>
+        <div class="input-group">
+            <label><b>① ファイルを選択 (複数選択可)</b></label><br>
+            <input type="file" id="fileInput" accept="video/*,.ser" multiple>
+        </div>
+        <div class="input-group">
+            <label><b>② フォルダごと選択</b></label><br>
+            <input type="file" id="folderInput" webkitdirectory directory multiple>
+        </div>
+        
+        <button type="submit" id="uploadBtn">アップロード開始</button>
         <button type="button" id="pauseBtn" style="display:none;">一時停止</button>
         <button type="button" id="cancelBtn" style="display:none;">キャンセル</button>
     </form>
 
-    <progress id="progressBar" value="0" max="100"></progress>
-    <div id="status"></div>
-    <div id="speedInfo"></div>
+    <!-- 全体の進捗 -->
+    <div id="overallProgressContainer" class="progress-container">
+        <div class="progress-title">全体の進捗: <span id="overallStatus" style="font-weight:normal;">0 / 0</span></div>
+        <progress id="overallProgressBar" value="0" max="100"></progress>
+    </div>
+
+    <!-- 現在のファイルの進捗 -->
+    <div id="fileProgressContainer" class="progress-container">
+        <div class="progress-title">現在のファイル: <span id="currentFileName" style="font-weight:normal; color:#0056b3;"></span></div>
+        <progress id="progressBar" value="0" max="100"></progress>
+        <div id="status">待機中...</div>
+        <div id="speedInfo"></div>
+    </div>
 
     <script>
         const retry_lim = {{ retry_lim }};
@@ -109,19 +130,32 @@ HTML_PAGE = """
         let currentUploadId = '';
         let sessionStartTime = 0;
         let sessionStartBytes = 0;
+        
+        // 複数ファイル処理用の変数
+        let fileQueue = [];
+        let currentFileIndex = 0;
 
         const uploadForm = document.getElementById('uploadForm');
         const fileInput = document.getElementById('fileInput');
+        const folderInput = document.getElementById('folderInput');
         const uploadBtn = document.getElementById('uploadBtn');
         const pauseBtn = document.getElementById('pauseBtn');
         const cancelBtn = document.getElementById('cancelBtn');
+        
+        const overallProgressContainer = document.getElementById('overallProgressContainer');
+        const overallProgressBar = document.getElementById('overallProgressBar');
+        const overallStatus = document.getElementById('overallStatus');
+        
+        const fileProgressContainer = document.getElementById('fileProgressContainer');
         const progressBar = document.getElementById('progressBar');
         const status = document.getElementById('status');
         const speedInfo = document.getElementById('speedInfo');
+        const currentFileName = document.getElementById('currentFileName');
 
         function resetUI() {
             uploadBtn.disabled = false;
             fileInput.disabled = false;
+            folderInput.disabled = false;
             pauseBtn.style.display = 'none';
             cancelBtn.style.display = 'none';
             pauseBtn.innerText = '一時停止';
@@ -130,6 +164,8 @@ HTML_PAGE = """
             isCanceled = false;
             currentXhr = null;
             currentUploadId = '';
+            fileInput.value = '';
+            folderInput.value = '';
         }
 
         function formatTime(seconds) {
@@ -144,7 +180,7 @@ HTML_PAGE = """
         }
 
         pauseBtn.addEventListener('click', function() {
-            if (isCanceled) return;
+            if (isCanceled || fileQueue.length === 0) return;
             if (!isPaused) {
                 isPaused = true;
                 pauseBtn.innerText = '再開';
@@ -162,7 +198,7 @@ HTML_PAGE = """
         });
 
         cancelBtn.addEventListener('click', async function() {
-            if (isCanceled) return;
+            if (isCanceled || fileQueue.length === 0) return;
             isCanceled = true;
             isPaused = false;
             if (currentXhr) currentXhr.abort();
@@ -180,42 +216,101 @@ HTML_PAGE = """
                     console.warn('キャンセルエラー:', err);
                 }
             }
-            status.innerText = 'アップロードをキャンセルしました。';
-            progressBar.style.display = 'none';
-            progressBar.value = 0;
+            status.innerText = 'すべてのアップロードをキャンセルしました。';
+            overallStatus.innerText = 'キャンセル済み';
+            fileQueue = []; // キューをクリア
             resetUI();
         });
 
         uploadForm.addEventListener('submit', async function(e) {
             e.preventDefault();
-            const file = fileInput.files[0];
-            if (!file) return;
+            
+            // ファイル入力とフォルダ入力のファイルを結合
+            const files = Array.from(fileInput.files).concat(Array.from(folderInput.files));
+            
+            // 拡張子フィルタ（フォルダ選択時の無関係なファイルを除外）
+            const allowedExtensions = ['.ser'];
+            fileQueue = files.filter(file => {
+                if (file.type.startsWith('video/')) return true;
+                const name = file.name.toLowerCase();
+                return allowedExtensions.some(ext => name.endsWith(ext));
+            });
 
+            if (fileQueue.length === 0) {
+                alert('アップロード対象のファイル（動画または.ser）が選択されていません。');
+                return;
+            }
+
+            // 初期化
+            currentFileIndex = 0;
+            isCanceled = false;
+            isPaused = false;
+
+            uploadBtn.disabled = true;
+            fileInput.disabled = true;
+            folderInput.disabled = true;
+            pauseBtn.style.display = 'inline-block';
+            cancelBtn.style.display = 'inline-block';
+            
+            overallProgressContainer.style.display = 'block';
+            fileProgressContainer.style.display = 'block';
+
+            processNextFile();
+        });
+
+        // キューに入ったファイルを順番に処理する関数
+        async function processNextFile() {
+            if (isCanceled) return;
+
+            if (currentFileIndex >= fileQueue.length) {
+                overallProgressBar.value = 100;
+                overallStatus.innerText = `完了 (${fileQueue.length} / ${fileQueue.length})`;
+                status.innerText = 'すべてのアップロードが完了しました！';
+                status.style.color = 'green';
+                speedInfo.innerText = '';
+                resetUI();
+                return;
+            }
+
+            const file = fileQueue[currentFileIndex];
+            
+            // 全体UIの更新
+            overallProgressBar.value = Math.round((currentFileIndex / fileQueue.length) * 100);
+            overallStatus.innerText = `${currentFileIndex + 1} / ${fileQueue.length} 個目を処理中...`;
+            
+            // 個別UIの更新
+            currentFileName.innerText = file.name;
+            progressBar.value = 0;
+            status.innerText = '準備中...';
+            status.style.color = 'black';
+            speedInfo.innerText = '';
+
+            await uploadSingleFile(file);
+            
+            if (!isCanceled) {
+                currentFileIndex++;
+                processNextFile();
+            }
+        }
+
+        // 1つのファイルをアップロードするロジック
+        async function uploadSingleFile(file) {
             try {
                 const checkRes = await fetch(`/check_file_exists?filename=${encodeURIComponent(file.name)}`);
                 if (checkRes.ok) {
                     const checkData = await checkRes.json();
                     if (checkData.exists) {
-                        const confirmOverwrite = confirm(`同名のファイル「${file.name}」が既に存在します。\\n上書きして続行しますか？`);
+                        const confirmOverwrite = confirm(`同名のファイル「${file.name}」が既に存在します。\\n上書きして続行しますか？\\n(キャンセルを押すとこのファイルをスキップします)`);
                         if (!confirmOverwrite) {
-                            status.innerText = '送信を中止しました。';
-                            status.style.color = 'black';
-                            return;
+                            status.innerText = 'スキップしました。';
+                            status.style.color = '#777';
+                            return true; // 処理自体は正常終了として次へ
                         }
                     }
                 }
             } catch (err) {
                 console.warn("重複チェックエラー:", err);
             }
-
-            resetUI();
-            uploadBtn.disabled = true;
-            fileInput.disabled = true;
-            pauseBtn.style.display = 'inline-block';
-            cancelBtn.style.display = 'inline-block';
-            status.style.color = 'black';
-            progressBar.style.display = 'block';
-            progressBar.value = 0;
 
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
             const rawId = `${file.name}_${file.size}_${file.lastModified}`;
@@ -235,20 +330,20 @@ HTML_PAGE = """
                 status.innerText = `続き（${startChunk + 1}/${totalChunks} チャンク目）から再開します...`;
             } else if (startChunk >= totalChunks) {
                 progressBar.value = 100;
-                status.innerText = `完了しています！`;
+                status.innerText = `既に完了しています`;
                 status.style.color = 'green';
-                resetUI();
-                fileInput.value = '';
-                return;
+                return true;
             }
 
+            sessionStartTime = 0;
+
             for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex++) {
-                if (isCanceled) break;
+                if (isCanceled) return false;
                 while (isPaused) {
-                    if (isCanceled) break;
+                    if (isCanceled) return false;
                     await new Promise(res => setTimeout(res, 200));
                 }
-                if (isCanceled) break;
+                if (isCanceled) return false;
 
                 if (sessionStartTime === 0) {
                     sessionStartTime = Date.now();
@@ -263,12 +358,12 @@ HTML_PAGE = """
                 let attempts = 0;
 
                 while (attempts <= retry_lim && !success) {
-                    if (isCanceled) break;
+                    if (isCanceled) return false;
                     while (isPaused) {
-                        if (isCanceled) break;
+                        if (isCanceled) return false;
                         await new Promise(res => setTimeout(res, 200));
                     }
-                    if (isCanceled) break;
+                    if (isCanceled) return false;
 
                     try {
                         if (attempts > 0) {
@@ -276,7 +371,7 @@ HTML_PAGE = """
                             status.style.color = 'orange';
                             speedInfo.innerText = '';
                             await new Promise(res => setTimeout(res, 1000 * attempts));
-                            if (isCanceled) break;
+                            if (isCanceled) return false;
                             sessionStartTime = Date.now();
                             sessionStartBytes = chunkIndex * CHUNK_SIZE;
                         }
@@ -296,29 +391,24 @@ HTML_PAGE = """
                         });
                         success = true;
                     } catch (err) {
-                        if (isCanceled) break;
+                        if (isCanceled) return false;
                         if (err.message === 'paused') continue;
                         attempts++;
                         if (attempts > retry_lim) {
                             status.innerText = `エラー: 送信に失敗しました。`;
                             status.style.color = 'red';
                             speedInfo.innerText = '';
-                            resetUI();
-                            return;
+                            return false;
                         }
                     }
                 }
             }
 
-            if (isCanceled) return;
             progressBar.value = 100;
-            status.innerText = `「${file.name}」のアップロードが完了しました！`;
+            status.innerText = `完了！`;
             status.style.color = 'green';
-            speedInfo.innerText = '';
-            progressBar.style.display = 'none';
-            resetUI();
-            fileInput.value = '';
-        });
+            return true;
+        }
 
         function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks, onProgress) {
             return new Promise((resolve, reject) => {
