@@ -93,11 +93,11 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <h1>動画・.serファイルを送信</h1>
+    <h1>ファイルを送信</h1>
     <form id="uploadForm">
         <div class="input-group">
             <label><b>① ファイルを選択 (複数選択可)</b></label><br>
-            <input type="file" id="fileInput" accept="video/*,.ser" multiple>
+            <input type="file" id="fileInput" accept=".*" multiple>
         </div>
         <div class="input-group">
             <label><b>② フォルダごと選択</b></label><br>
@@ -501,7 +501,7 @@ def upload_chunk():
         with open(temp_filepath, 'a+b') as f:
             f.seek(chunk_index * CHUNK_SIZE)
             f.write(chunk.read())
-        logger.info(f"[{request.remote_addr}] チャンク受信完了: '{filename}' ({chunk_index + 1}/{total_chunks})")
+        logger.debug(f"[{request.remote_addr}] チャンク受信完了: '{filename}' ({chunk_index + 1}/{total_chunks})")
     except Exception as e:
         logger.error(f"[{request.remote_addr}] チャンクの書き込みに失敗しました '{filename}': {e}")
         return "書き込みエラー", 500
