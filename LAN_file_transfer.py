@@ -90,6 +90,14 @@ HTML_PAGE = """
         #speedInfo { margin-top: 5px; color: #555; font-size: 0.9em; }
         button { padding: 8px 16px; margin-right: 5px; cursor: pointer; font-size: 14px; }
         button:disabled { cursor: not-allowed; opacity: 0.6; }
+        
+        /* キュー用のスタイル */
+        #queueContainer { max-height: 250px; overflow-y: auto; }
+        #queueTable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+        #queueTable th, #queueTable td { padding: 6px; border-bottom: 1px solid #ddd; text-align: left; }
+        .btn-remove { padding: 3px 8px; font-size: 11px; color: white; background: #dc3545; border: none; border-radius: 3px; cursor: pointer; }
+        .btn-remove:hover { background: #c82333; }
+        .file-name-cell { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     </style>
 </head>
 <body>
@@ -113,6 +121,22 @@ HTML_PAGE = """
     <div id="overallProgressContainer" class="progress-container">
         <div class="progress-title">全体の進捗: <span id="overallStatus" style="font-weight:normal;">0 / 0</span></div>
         <progress id="overallProgressBar" value="0" max="100"></progress>
+    </div>
+
+    <!-- アップロードキュー -->
+    <div id="queueContainer" class="progress-container">
+        <div class="progress-title">アップロードキュー</div>
+        <table id="queueTable">
+            <thead>
+                <tr>
+                    <th>ファイル名</th>
+                    <th>サイズ</th>
+                    <th>状態</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody id="queueBody"></tbody>
+        </table>
     </div>
 
     <!-- 現在のファイルの進捗 -->
@@ -149,6 +173,9 @@ HTML_PAGE = """
         const overallProgressBar = document.getElementById('overallProgressBar');
         const overallStatus = document.getElementById('overallStatus');
         
+        const queueContainer = document.getElementById('queueContainer');
+        const queueBody = document.getElementById('queueBody');
+
         const fileProgressContainer = document.getElementById('fileProgressContainer');
         const progressBar = document.getElementById('progressBar');
         const status = document.getElementById('status');
@@ -180,6 +207,58 @@ HTML_PAGE = """
             const hours = Math.floor(mins / 60);
             const remMins = mins % 60;
             return `${hours}時間${remMins}分`;
+        }
+
+        // キュー表示を更新する関数
+        function renderQueue() {
+            queueBody.innerHTML = '';
+            fileQueue.forEach((file, index) => {
+                const tr = document.createElement('tr');
+                
+                const tdName = document.createElement('td');
+                tdName.innerText = file.name;
+                tdName.title = file.name;
+                tdName.className = 'file-name-cell';
+                
+                const tdSize = document.createElement('td');
+                tdSize.innerText = (file.size / (1024 * 1024)).toFixed(1) + ' MB';
+                
+                const tdStatus = document.createElement('td');
+                const tdAction = document.createElement('td');
+
+                if (index < currentFileIndex) {
+                    tdStatus.innerText = '完了';
+                    tdStatus.style.color = 'green';
+                } else if (index === currentFileIndex) {
+                    tdStatus.innerText = isCanceled ? 'キャンセル' : '処理中...';
+                    tdStatus.style.color = 'blue';
+                } else {
+                    tdStatus.innerText = '待機中';
+                    tdStatus.style.color = '#555';
+                    
+                    const removeBtn = document.createElement('button');
+                    removeBtn.innerText = '削除';
+                    removeBtn.className = 'btn-remove';
+                    removeBtn.onclick = () => removeQueueItem(index);
+                    tdAction.appendChild(removeBtn);
+                }
+                
+                tr.appendChild(tdName);
+                tr.appendChild(tdSize);
+                tr.appendChild(tdStatus);
+                tr.appendChild(tdAction);
+                queueBody.appendChild(tr);
+            });
+        }
+
+        // 待機中のファイルをキューから削除する関数
+        function removeQueueItem(index) {
+            if (index > currentFileIndex) {
+                fileQueue.splice(index, 1);
+                overallProgressBar.value = Math.round((currentFileIndex / fileQueue.length) * 100) || 0;
+                overallStatus.innerText = `${currentFileIndex + 1} / ${fileQueue.length} 個目を処理中...`;
+                renderQueue();
+            }
         }
 
         pauseBtn.addEventListener('click', function() {
@@ -222,6 +301,7 @@ HTML_PAGE = """
             status.innerText = 'すべてのアップロードをキャンセルしました。';
             overallStatus.innerText = 'キャンセル済み';
             fileQueue = []; // キューをクリア
+            renderQueue();
             resetUI();
         });
 
@@ -256,8 +336,10 @@ HTML_PAGE = """
             cancelBtn.style.display = 'inline-block';
             
             overallProgressContainer.style.display = 'block';
+            queueContainer.style.display = 'block';
             fileProgressContainer.style.display = 'block';
 
+            renderQueue();
             processNextFile();
         });
 
@@ -271,9 +353,12 @@ HTML_PAGE = """
                 status.innerText = 'すべてのアップロードが完了しました！';
                 status.style.color = 'green';
                 speedInfo.innerText = '';
+                renderQueue(); // 最後の状態を更新
                 resetUI();
                 return;
             }
+
+            renderQueue(); // 現在のファイルのステータスを「処理中」に更新
 
             const file = fileQueue[currentFileIndex];
             
