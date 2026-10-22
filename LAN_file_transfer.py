@@ -1,7 +1,11 @@
 import datetime
 import logging
 import os
+import platform
+import re
 import shutil
+import socket
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -38,7 +42,10 @@ DEFAULT_CONFIG = {
     'UPLOAD_FOLDER': 'uploads',
     'TEMP_FOLDER': 'temp_uploads',
     'HOST': '0.0.0.0',
-    'PORT': 5000
+    'PORT': 5000,
+    # 直結時は受信側PCのEthernetをこの固定IPに設定する
+    'DIRECT_ETHERNET_IP': '192.168.50.1',
+    'DIRECT_ETHERNET_SUBNET_MASK': '255.255.255.0'
 }
 
 if not os.path.exists(CONFIG_FILE):
@@ -63,7 +70,9 @@ CHUNK_SIZE = config.get('CHUNK_SIZE', 5242880)
 UPLOAD_FOLDER = config.get('UPLOAD_FOLDER', 'uploads')
 TEMP_FOLDER = config.get('TEMP_FOLDER', 'temp_uploads')
 HOST = config.get('HOST', '0.0.0.0')
-PORT = config.get('PORT', 5000)
+PORT = int(config.get('PORT', 5000))
+DIRECT_ETHERNET_IP = str(config.get('DIRECT_ETHERNET_IP', '192.168.50.1'))
+DIRECT_ETHERNET_SUBNET_MASK = str(config.get('DIRECT_ETHERNET_SUBNET_MASK', '255.255.255.0'))
 
 app = Flask(__name__)
 
@@ -116,10 +125,40 @@ HTML_PAGE = """
         .btn-remove { padding: 3px 8px; font-size: 11px; color: white; background: #dc3545; border: none; border-radius: 3px; cursor: pointer; }
         .btn-remove:hover { background: #c82333; }
         .file-name-cell { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .connection-panel { max-width: 760px; margin: 0 0 20px; padding: 14px 16px; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; }
+        .connection-panel h2 { margin: 0 0 8px; font-size: 18px; }
+        .connection-panel select { padding: 7px; font-size: 14px; }
+        .connection-details { margin-top: 12px; padding: 12px; border-left: 4px solid #2563eb; background: #fff; }
+        .connection-details ol { margin-top: 8px; padding-left: 22px; }
+        .connection-details code { overflow-wrap: anywhere; }
+        .muted { color: #555; font-size: 0.92em; }
     </style>
 </head>
 <body>
     <h1>ファイルを送信</h1>
+
+    <section class="connection-panel" aria-labelledby="connectionModeTitle">
+        <h2 id="connectionModeTitle">接続方法</h2>
+        <label for="connectionMode"><b>転送ネットワーク：</b></label>
+        <select id="connectionMode">
+            <option value="lan">通常のLAN / Wi-Fi</option>
+            <option value="direct">PC同士をイーサネット直結</option>
+        </select>
+        <p class="muted">受信側（保存先PC）でこのアプリを起動し、送信側PCのブラウザーから受信側のURLを開きます。</p>
+        <div id="directConnectionDetails" class="connection-details" hidden>
+            <b>イーサネット直結の設定</b>
+            <ol>
+                <li>2台のPCをLANケーブルで直接接続します（ルーターは不要です）。</li>
+                <li>受信側PCの Ethernet IPv4 を <code id="directServerIp">192.168.50.1</code>、サブネットマスクを <code id="directSubnetMask">255.255.255.0</code> に設定します。デフォルトゲートウェイとDNSは空欄で構いません。</li>
+                <li>送信側PCの Ethernet IPv4 を <code>192.168.50.2</code>、サブネットマスクを <code id="directSubnetMaskSender">255.255.255.0</code> に設定します。IPアドレスは2台で重複させないでください。</li>
+                <li>送信側PCで次の受信側URLを開きます：<strong><code id="directTransferUrl">http://192.168.50.1:5000</code></strong></li>
+                <li>Windows ファイアウォールが通信を尋ねたら、信頼できるプライベートネットワーク上でのみ許可してください。</li>
+            </ol>
+            <div><b>このPCで検出したIPv4アドレス：</b> <span id="localAddresses">取得中...</span></div>
+            <p class="muted">推奨IPが既存ネットワークと重複する場合は、設定ファイルの <code>DIRECT_ETHERNET_IP</code> と案内するIPを別の未使用サブネットに変更してください。直結モードはネットワーク設定を自動変更せず、既存のアップロード機能で転送します。</p>
+        </div>
+    </section>
+
     <form id="uploadForm">
         <div class="input-group">
             <label><b>① ファイルを選択 (複数選択可)</b></label><br>
@@ -168,6 +207,34 @@ HTML_PAGE = """
     <script>
         const retry_lim = {{ retry_lim }};
         const CHUNK_SIZE = {{ chunk_size }};
+
+        const connectionMode = document.getElementById('connectionMode');
+        const directConnectionDetails = document.getElementById('directConnectionDetails');
+        const directServerIp = document.getElementById('directServerIp');
+        const directSubnetMask = document.getElementById('directSubnetMask');
+        const directSubnetMaskSender = document.getElementById('directSubnetMaskSender');
+        const directTransferUrl = document.getElementById('directTransferUrl');
+        const localAddresses = document.getElementById('localAddresses');
+
+        function updateConnectionMode() {
+            directConnectionDetails.hidden = connectionMode.value !== 'direct';
+        }
+        connectionMode.addEventListener('change', updateConnectionMode);
+        updateConnectionMode();
+
+        fetch('/connection_info').then(response => response.ok ? response.json() : Promise.reject())
+            .then(info => {
+                directServerIp.textContent = info.direct_ethernet_ip;
+                directSubnetMask.textContent = info.direct_ethernet_subnet_mask;
+                directSubnetMaskSender.textContent = info.direct_ethernet_subnet_mask;
+                directTransferUrl.textContent = info.direct_ethernet_url;
+                if (info.addresses && info.addresses.length) {
+                    localAddresses.textContent = info.addresses.map(item => `${item.adapter}: ${item.ip}`).join(' / ');
+                } else {
+                    localAddresses.textContent = '検出できませんでした。OSのネットワーク設定をご確認ください。';
+                }
+            })
+            .catch(() => { localAddresses.textContent = '取得できませんでした。'; });
 
         let currentXhr = null;
         let isPaused = false;
@@ -559,10 +626,70 @@ HTML_PAGE = """
 </html>
 """
 
+def get_local_ipv4_addresses():
+    """OS標準コマンド等から各ネットワークインターフェースのIPv4を取得する。"""
+    addresses = []
+    seen = set()
+
+    def add(adapter, ip):
+        if not ip or ip.startswith('127.') or ip in seen:
+            return
+        seen.add(ip)
+        addresses.append({'adapter': adapter or 'ネットワーク', 'ip': ip})
+
+    if platform.system() == 'Windows':
+        try:
+            result = subprocess.run(
+                ['ipconfig'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3, check=False
+            )
+            adapter = 'ネットワークアダプター'
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped and not line[:1].isspace() and stripped.endswith(':'):
+                    adapter = stripped[:-1]
+                match = re.search(r'IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})', line, re.IGNORECASE)
+                if match:
+                    add(adapter, match.group(1))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug('ipconfig によるIPアドレス検出に失敗しました: %s', exc)
+    else:
+        try:
+            result = subprocess.run(
+                ['ip', '-o', '-4', 'addr', 'show'], capture_output=True, text=True, timeout=3, check=False
+            )
+            for line in result.stdout.splitlines():
+                match = re.match(r'\d+:\s+([^\s:@]+).*?\sinet\s+(\d{1,3}(?:\.\d{1,3}){3})/', line)
+                if match:
+                    add(match.group(1), match.group(2))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug('ip コマンドによるIPアドレス検出に失敗しました: %s', exc)
+
+    # OSコマンドで得られない環境向けのフォールバック（既定経路側のアドレス）
+    if not addresses:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                add(socket.gethostname(), info[4][0])
+        except OSError as exc:
+            logger.debug('ホスト名からのIPアドレス検出に失敗しました: %s', exc)
+
+    return addresses
+
+
 @app.route('/')
 def index():
     logger.info(f"[{request.remote_addr}] トップページにアクセスしました。")
     return render_template_string(HTML_PAGE, retry_lim=RETRY_LIM, chunk_size=CHUNK_SIZE)
+
+
+@app.route('/connection_info', methods=['GET'])
+def connection_info():
+    """直結モードの設定案内に使うIPアドレス情報を返す。"""
+    return jsonify({
+        'addresses': get_local_ipv4_addresses(),
+        'direct_ethernet_ip': DIRECT_ETHERNET_IP,
+        'direct_ethernet_subnet_mask': DIRECT_ETHERNET_SUBNET_MASK,
+        'direct_ethernet_url': f'http://{DIRECT_ETHERNET_IP}:{PORT}'
+    })
 
 @app.route('/check_file_exists', methods=['GET'])
 def check_file_exists():
