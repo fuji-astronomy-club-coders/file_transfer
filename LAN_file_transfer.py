@@ -6,7 +6,7 @@ import re
 import shutil
 import socket
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 from flask import Flask, jsonify, render_template_string, request
@@ -85,6 +85,69 @@ def suppress_werkzeug_logs_after_first_request():
     # 2回目以降のアクセスで毎回実行されないよう関数自体を取り除く
     app.before_request_funcs[None].remove(suppress_werkzeug_logs_after_first_request)
     
+def sanitize_relative_path(raw_path):
+    """アップロード相対パスを検証し、OS依存の危険な文字を除去する。
+
+    Parameters
+    ----------
+    raw_path : str
+        ブラウザーから受け取ったファイル名または相対パス。
+
+    Returns
+    -------
+    pathlib.Path
+        アップロード先ルートからの相対パス。
+
+    Raises
+    ------
+    ValueError
+        空のパス、絶対パス、または親ディレクトリへの参照が含まれる場合。
+    """
+    value = str(raw_path or '').replace('\\', '/')
+    if not value or value.startswith('/') or re.match(r'^[A-Za-z]:', value):
+        raise ValueError('相対パスが無効です')
+
+    raw_parts = PurePosixPath(value).parts
+    if not raw_parts or any(part in ('', '.', '..', '/') for part in raw_parts):
+        raise ValueError('相対パスに無効な要素が含まれています')
+
+    safe_parts = []
+    reserved_names = {
+        'CON', 'PRN', 'AUX', 'NUL',
+        *(f'COM{i}' for i in range(1, 10)),
+        *(f'LPT{i}' for i in range(1, 10)),
+    }
+    for part in raw_parts:
+        # Windowsでファイル名に使えない文字と制御文字を置換する。
+        safe = re.sub(r'[<>:"|?*\x00-\x1f]', '_', part).rstrip(' .')
+        if not safe or safe in ('.', '..'):
+            raise ValueError('ファイル名が無効です')
+        if safe.split('.')[0].upper() in reserved_names:
+            safe = f'_{safe}'
+        safe_parts.append(safe)
+
+    return Path(*safe_parts)
+
+
+def resolve_upload_path(relative_path):
+    """アップロード相対パスを保存先ルート内の絶対パスへ解決する。"""
+    root = Path(UPLOAD_FOLDER).resolve()
+    destination = (root / relative_path).resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise ValueError('保存先がアップロードフォルダーの外側です') from exc
+    return destination
+
+
+def normalize_upload_id(raw_upload_id):
+    """一時ファイル名に使えるアップロードIDを返す。"""
+    upload_id = secure_filename(str(raw_upload_id or ''))
+    if not upload_id or upload_id in {'.', '..'}:
+        raise ValueError('アップロードIDが無効です')
+    return upload_id
+
+
 def cleanup_temp_folder():
     """起動時に未完了の過去の一時ファイルを全削除する関数"""
     if os.path.exists(TEMP_FOLDER):
@@ -167,6 +230,7 @@ HTML_PAGE = """
         <div class="input-group">
             <label><b>② フォルダごと選択</b></label><br>
             <input type="file" id="folderInput" webkitdirectory directory multiple>
+            <p class="muted">フォルダー構造とファイルの最終更新日時を保持して転送します。</p>
         </div>
         
         <button type="submit" id="uploadBtn">アップロード開始</button>
@@ -302,6 +366,21 @@ HTML_PAGE = """
             return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
         }
 
+        // 相対パスが長い場合でも一時ファイル名がOSの長さ制限を超えないようにする。
+        // 同じファイルを選び直した場合には同じIDとなり、レジュームに利用できる。
+        function createUploadId(file, relativePath) {
+            const source = `${relativePath}\u0000${file.size}\u0000${file.lastModified}`;
+            let hashA = 2166136261;
+            let hashB = 0x9e3779b9;
+            for (let i = 0; i < source.length; i++) {
+                const code = source.charCodeAt(i);
+                hashA = Math.imul(hashA ^ code, 16777619);
+                hashB = Math.imul(hashB ^ (code + i), 2246822519);
+            }
+            const suffix = `${file.size}_${file.lastModified}`;
+            return `${(hashA >>> 0).toString(16).padStart(8, '0')}${(hashB >>> 0).toString(16).padStart(8, '0')}_${suffix}`;
+        }
+
         // キュー表示を更新する関数 (修正)
         function renderQueue() {
             queueBody.innerHTML = '';
@@ -309,8 +388,9 @@ HTML_PAGE = """
                 const tr = document.createElement('tr');
                 
                 const tdName = document.createElement('td');
-                tdName.innerText = file.name;
-                tdName.title = file.name;
+                const relativePath = file.webkitRelativePath || file.name;
+                tdName.innerText = relativePath;
+                tdName.title = relativePath;
                 tdName.className = 'file-name-cell';
                 
                 const tdSize = document.createElement('td');
@@ -473,7 +553,8 @@ HTML_PAGE = """
         // 1つのファイルをアップロードするロジック
         async function uploadSingleFile(file) {
             try {
-                const checkRes = await fetch(`/check_file_exists?filename=${encodeURIComponent(file.name)}`);
+                const relativePath = file.webkitRelativePath || file.name;
+            const checkRes = await fetch(`/check_file_exists?path=${encodeURIComponent(relativePath)}`);
                 if (checkRes.ok) {
                     const checkData = await checkRes.json();
                     if (checkData.exists) {
@@ -489,9 +570,9 @@ HTML_PAGE = """
                 console.warn("重複チェックエラー:", err);
             }
 
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            const rawId = `${file.name}_${file.size}_${file.lastModified}`;
-            currentUploadId = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+            const relativePath = file.webkitRelativePath || file.name;
+            currentUploadId = createUploadId(file, relativePath);
 
             let startChunk = 0;
             try {
@@ -553,10 +634,10 @@ HTML_PAGE = """
                             sessionStartBytes = chunkIndex * CHUNK_SIZE;
                         }
 
-                        await sendChunk(chunk, file.name, currentUploadId, chunkIndex, totalChunks, (loadedInChunk) => {
+                        await sendChunk(chunk, file, relativePath, currentUploadId, chunkIndex, totalChunks, (loadedInChunk) => {
                             if (isPaused || isCanceled) return;
                             const totalLoadedBytes = (chunkIndex * CHUNK_SIZE) + loadedInChunk;
-                            progressBar.value = Math.round((totalLoadedBytes / file.size) * 100);
+                            progressBar.value = file.size === 0 ? 100 : Math.round((totalLoadedBytes / file.size) * 100);
                             status.innerText = `${progressBar.value}% アップロード中... (${chunkIndex + 1}/${totalChunks} チャンク)`;
                             status.style.color = 'black';
 
@@ -587,11 +668,14 @@ HTML_PAGE = """
             return true;
         }
 
-        function sendChunk(chunk, fileName, uploadId, chunkIndex, totalChunks, onProgress) {
+        function sendChunk(chunk, file, relativePath, uploadId, chunkIndex, totalChunks, onProgress) {
             return new Promise((resolve, reject) => {
                 const formData = new FormData();
                 formData.append('chunk', chunk);
-                formData.append('filename', fileName);
+                formData.append('filename', file.name);
+                formData.append('relative_path', relativePath);
+                formData.append('last_modified_ms', String(file.lastModified));
+                formData.append('file_size', String(file.size));
                 formData.append('upload_id', uploadId);
                 formData.append('chunk_index', chunkIndex);
                 formData.append('total_chunks', totalChunks);
@@ -693,81 +777,132 @@ def connection_info():
 
 @app.route('/check_file_exists', methods=['GET'])
 def check_file_exists():
-    filename = secure_filename(request.args.get('filename', ''))
-    if not filename:
-        return jsonify({'exists': False})
-    
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    exists = os.path.exists(filepath)
-    logger.info(f"[{request.remote_addr}] ファイル重複チェック: '{filename}' -> 存在: {exists}")
+    """保存先の相対パスが既に存在するか確認する。"""
+    raw_path = request.args.get('path') or request.args.get('filename', '')
+    try:
+        relative_path = sanitize_relative_path(raw_path)
+        filepath = resolve_upload_path(relative_path)
+    except ValueError as exc:
+        logger.warning("[%s] 無効な重複チェックパス: %s", request.remote_addr, exc)
+        return jsonify({'exists': False, 'error': '無効なパスです'}), 400
+
+    exists = filepath.is_file()
+    logger.info("[%s] ファイル重複チェック: '%s' -> 存在: %s", request.remote_addr, relative_path, exists)
     return jsonify({'exists': exists})
 
 @app.route('/upload_status', methods=['GET'])
 def upload_status():
-    upload_id = secure_filename(request.args.get('upload_id', ''))
-    if not upload_id:
-        return jsonify({'received_chunks': 0})
+    """中断したアップロードの受信済みチャンク数を返す。"""
+    try:
+        upload_id = normalize_upload_id(request.args.get('upload_id', ''))
+    except ValueError:
+        return jsonify({'received_chunks': 0}), 400
 
-    temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
-    if os.path.exists(temp_filepath):
-        current_size = os.path.getsize(temp_filepath)
+    temp_filepath = Path(TEMP_FOLDER) / upload_id
+    if temp_filepath.is_file():
+        current_size = temp_filepath.stat().st_size
         received_chunks = current_size // CHUNK_SIZE
-        logger.info(f"[{request.remote_addr}] レジューム確認: ID '{upload_id}', 完了チャンク数: {received_chunks}")
+        logger.info("[%s] レジューム確認: ID '%s', 完了チャンク数: %s", request.remote_addr, upload_id, received_chunks)
         return jsonify({'received_chunks': received_chunks})
-    
+
     return jsonify({'received_chunks': 0})
 
 @app.route('/upload_chunk', methods=['POST'])
 def upload_chunk():
-    chunk = request.files.get('chunk')
-    filename = secure_filename(request.form.get('filename', ''))
-    upload_id = secure_filename(request.form.get('upload_id', ''))
-    chunk_index = int(request.form.get('chunk_index', 0))
-    total_chunks = int(request.form.get('total_chunks', 1))
+    """チャンクを受信し、最終チャンク受信時にファイルを確定する。
 
-    if not chunk or not filename or not upload_id:
-        logger.warning(f"[{request.remote_addr}] 無効なチャンクデータが送信されました。")
+    ファイルのバイト列は変更せず、ブラウザーが公開する最終更新日時を復元する。
+    フォルダー選択時は相対パスも維持する。
+    """
+    chunk = request.files.get('chunk')
+    raw_path = request.form.get('relative_path') or request.form.get('filename', '')
+    try:
+        relative_path = sanitize_relative_path(raw_path)
+        final_filepath = resolve_upload_path(relative_path)
+        upload_id = normalize_upload_id(request.form.get('upload_id', ''))
+        chunk_index = int(request.form.get('chunk_index', '0'))
+        total_chunks = int(request.form.get('total_chunks', '1'))
+        file_size = int(request.form.get('file_size', '-1'))
+    except (ValueError, TypeError):
+        logger.warning("[%s] 無効なチャンクメタデータが送信されました。", request.remote_addr)
         return "データが無効です", 400
 
-    temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
+    if (
+        not chunk
+        or chunk_index < 0
+        or total_chunks < 1
+        or chunk_index >= total_chunks
+        or file_size < 0
+    ):
+        logger.warning("[%s] 無効なチャンクデータが送信されました。", request.remote_addr)
+        return "データが無効です", 400
 
     try:
-        with open(temp_filepath, 'a+b') as f:
-            f.seek(chunk_index * CHUNK_SIZE)
-            f.write(chunk.read())
-        logger.debug(f"[{request.remote_addr}] チャンク受信完了: '{filename}' ({chunk_index + 1}/{total_chunks})")
-    except Exception as e:
-        logger.error(f"[{request.remote_addr}] チャンクの書き込みに失敗しました '{filename}': {e}")
+        last_modified_ms = int(request.form.get('last_modified_ms', ''))
+    except (ValueError, TypeError):
+        last_modified_ms = None
+
+    temp_filepath = Path(TEMP_FOLDER) / upload_id
+
+    try:
+        temp_filepath.parent.mkdir(parents=True, exist_ok=True)
+        # a+b では seek() 後も常に末尾へ書き込まれるため、r+b / w+b を使う。
+        mode = 'r+b' if temp_filepath.exists() else 'w+b'
+        with temp_filepath.open(mode) as file_handle:
+            file_handle.seek(chunk_index * CHUNK_SIZE)
+            shutil.copyfileobj(chunk.stream, file_handle)
+        logger.debug(
+            "[%s] チャンク受信完了: '%s' (%s/%s)",
+            request.remote_addr, relative_path, chunk_index + 1, total_chunks,
+        )
+    except OSError as exc:
+        logger.error("[%s] チャンクの書き込みに失敗しました '%s': %s", request.remote_addr, relative_path, exc)
         return "書き込みエラー", 500
 
     if chunk_index == total_chunks - 1:
-        final_filepath = os.path.join(UPLOAD_FOLDER, filename)
         try:
-            if os.path.exists(final_filepath):
-                os.remove(final_filepath)
-                logger.info(f"[{request.remote_addr}] 既存ファイル '{filename}' を上書きのために削除しました。")
-            os.rename(temp_filepath, final_filepath)
-            logger.info(f"[{request.remote_addr}] 転送完了: '{filename}' が '{UPLOAD_FOLDER}' フォルダに保存されました。")
-        except Exception as e:
-            logger.error(f"[{request.remote_addr}] 一時ファイルから最終ファイルへの結合・移動に失敗しました: {e}")
+            actual_size = temp_filepath.stat().st_size
+            if actual_size != file_size:
+                logger.warning(
+                    "[%s] ファイルサイズ不一致: '%s' (expected=%s, actual=%s)",
+                    request.remote_addr, relative_path, file_size, actual_size,
+                )
+                return "受信サイズが一致しません", 400
+
+            final_filepath.parent.mkdir(parents=True, exist_ok=True)
+            if last_modified_ms is not None:
+                # File.lastModified は Unix epoch からのミリ秒。
+                # atime は送信元から取得できないため、mtime のみを復元する。
+                os.utime(temp_filepath, (datetime.datetime.now().timestamp(), last_modified_ms / 1000))
+            # 既存ファイル削除を先行させず、置換を原子的に行う。
+            os.replace(temp_filepath, final_filepath)
+            logger.info(
+                "[%s] 転送完了: '%s' を保存しました (last_modified_preserved=%s)",
+                request.remote_addr, relative_path, last_modified_ms is not None,
+            )
+        except (OSError, ValueError, OverflowError) as exc:
+            logger.error("[%s] ファイル確定処理に失敗しました '%s': %s", request.remote_addr, relative_path, exc)
             return "ファイル処理エラー", 500
 
     return "OK", 200
 
 @app.route('/upload_cancel', methods=['POST'])
 def upload_cancel():
-    upload_id = secure_filename(request.form.get('upload_id', ''))
-    if not upload_id:
-        logger.warning(f"[{request.remote_addr}] 無効なキャンセルリクエスト。")
+    """中断したアップロードの一時ファイルを削除する。"""
+    try:
+        upload_id = normalize_upload_id(request.form.get('upload_id', ''))
+    except ValueError:
+        logger.warning("[%s] 無効なキャンセルリクエスト。", request.remote_addr)
         return "データが無効です", 400
 
-    temp_filepath = os.path.join(TEMP_FOLDER, upload_id)
-    if os.path.exists(temp_filepath):
+    temp_filepath = Path(TEMP_FOLDER) / upload_id
+    if temp_filepath.is_file():
         try:
-            os.remove(temp_filepath)
-            logger.info(f"[{request.remote_addr}] [キャンセル] 一時ファイル '{upload_id}' を削除しました。")
-        except Exception as e:
-            logger.error(f"[{request.remote_addr}] [警告] 一時ファイルの削除に失敗しました: {e}")
+            temp_filepath.unlink()
+            logger.info("[%s] [キャンセル] 一時ファイル '%s' を削除しました。", request.remote_addr, upload_id)
+        except OSError as exc:
+            logger.error("[%s] [警告] 一時ファイルの削除に失敗しました: %s", request.remote_addr, exc)
+            return "削除エラー", 500
 
     return "OK", 200
 
